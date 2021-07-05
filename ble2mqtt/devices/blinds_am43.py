@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 from ..protocols.base import BLEQueueMixin
-from .base import COVER_DOMAIN, Device
 from ..utils import format_binary
+from .base import COVER_DOMAIN, Device
 
 logger = logging.getLogger(__name__)
 
@@ -234,8 +234,7 @@ class AM43Cover(BLEQueueMixin, Device):
         elif movement_type == 'close':
             await self.send_command(self.CMD_MOVE, [0xee])
             self._state.run_state = RunState.CLOSING
-        elif movement_type == 'position' and \
-                not position is None:
+        elif movement_type == 'position' and position is not None:
             if 0 <= position <= 100:
                 await self.send_command(self.CMD_SET_POSITION, [int(position)])
                 if self._state.position < position:
