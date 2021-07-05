@@ -205,15 +205,20 @@ class AM43Cover(BLEQueueMixin, Device):
 
             timer += self.ACTIVE_SLEEP_INTERVAL
             if timer >= self.SEND_DATA_PERIOD * multiplier:
-
                 if is_running:
                     logger.info(f'[{self}] check for position')
                     await self._request_position()
                     if self._state.run_state == RunState.CLOSING and \
                             self._state.position == self.MAX_POSITION:
+                        logger.info(
+                            f'[{self}] Maximum position reached. Set to CLOSED',
+                        )
                         self._state.run_state = RunState.CLOSED
                     elif self._state.run_state == RunState.OPENING and \
                             self._state.position == self.MIN_POSITION:
+                        logger.info(
+                            f'[{self}] Minimum position reached. Set to OPENED',
+                        )
                         self._state.run_state = RunState.OPENED
                 else:
                     logger.info(f'[{self}] check for full state')
