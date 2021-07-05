@@ -6,3 +6,4 @@ from .presence import Presence  # noqa
 from .xiaomi_ht import XiaomiHumidityTemperatureV1  # noqa
 from .xiaomi_lywsd03 import XiaomiHumidityTemperatureLYWSD  # noqa
 from .xiaomi_lywsd03_atc import XiaomiHumidityTemperatureLYWSDATC  # noqa
+from .blinds_am43 import AM43Cover # noqa
