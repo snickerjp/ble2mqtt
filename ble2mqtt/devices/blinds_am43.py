@@ -66,6 +66,7 @@ class AM43Cover(BLEQueueMixin, Device):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._model = 'AM43'
         self._state = AM43State()
 
     def notification_callback(self, sender_handle: int, data: bytearray):
