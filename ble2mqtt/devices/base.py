@@ -165,7 +165,12 @@ class Device(BaseDevice, abc.ABC):
             f'{self.unique_id}/{entity["name"]}/{self.SET_POSTFIX}'
             for cls, items in self.entities.items()
             for entity in items
-            if cls in [SWITCH_DOMAIN, LIGHT_DOMAIN]
+            if cls in [SWITCH_DOMAIN, LIGHT_DOMAIN, COVER_DOMAIN]
+        ] + [
+            f'{self.unique_id}/{entity["name"]}/{self.POSITION_POSTFIX}'
+            for cls, items in self.entities.items()
+            for entity in items
+            if cls in [COVER_DOMAIN]
         ]
 
     @property

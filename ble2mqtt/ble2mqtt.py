@@ -370,7 +370,7 @@ class DeviceManager:
             if cls == COVER_DOMAIN:
                 for entity in entities:
                     entity_name = entity['name']
-                    state_topic = self._get_topic(device.unique_id, entity_name)
+                    # state_topic = self._get_topic(device.unique_id, entity_name)
                     set_topic = self._get_topic(
                         device.unique_id,
                         entity_name,
