@@ -370,7 +370,7 @@ class DeviceManager:
             if cls == COVER_DOMAIN:
                 for entity in entities:
                     entity_name = entity['name']
-                    # state_topic = self._get_topic(device.unique_id, entity_name)
+                    state_topic = self._get_topic(device.unique_id, entity_name)
                     set_topic = self._get_topic(
                         device.unique_id,
                         entity_name,
@@ -395,9 +395,9 @@ class DeviceManager:
                     ))
                     payload = json.dumps({
                         **get_generic_vals(entity),
-                        # 'state_topic': state_topic,
+                        'state_topic': state_topic,
+                        # 'position_topic': state_topic,
                         'command_topic': set_topic,
-                        'position_topic': set_topic,
                         'set_position_topic': set_position_topic,
                         'position_template': '{{ value_json.position }}',
                     })
