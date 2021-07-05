@@ -27,7 +27,7 @@ class RunState(Enum):
 @dataclass
 class AM43State:
     battery: int = None
-    position: int = None
+    position: int = 0
     light: int = None
     run_state: RunState = RunState.STOPPED
     target_position: int = None
@@ -52,6 +52,11 @@ class AM43Cover(BLEQueueMixin, Device):
     CMD_GET_POSITION = 0xa7
     CMD_SET_POSITION = 0x0d
     NOTIFY_POSITION = 0xa1
+
+    AM43_RESPONSE_ACK = 0x5a
+    AM43_RESPONSE_NACK = 0xa5
+    AM43_REPLY_UNKNOWN1 = 0xa8
+    AM43_REPLY_UNKNOWN2 = 0xa9
 
     @property
     def entities(self):
@@ -140,6 +145,13 @@ class AM43Cover(BLEQueueMixin, Device):
         elif data[1] == self.CMD_GET_LIGHT:
             # b'\x9a\xaa\x02\x00\x002'
             self._state.light = int(data[4]) * 12.5
+        elif data[1] == self.CMD_MOVE:
+            if data[3] != self.AM43_RESPONSE_ACK:
+                logger.error(f'[{self}] Problem with moving: NACK')
+        elif data[1] in [self.AM43_REPLY_UNKNOWN1, self.AM43_REPLY_UNKNOWN2]:
+            # [9a a8 00 32]
+            # [9a a9 10 00 00 00 11 00 00 00 00 01 00 00 11 00 00 00 00 22]
+            pass
         else:
             logger.error(
                 f'{self} BLE notification unknown response '
@@ -169,7 +181,7 @@ class AM43Cover(BLEQueueMixin, Device):
                     topic='/'.join(
                         (self.unique_id, cover['name'], self.POSITION_POSTFIX),
                     ),
-                    value=self._state.position or '',
+                    value=self._state.position,
                 ))
         if coros:
             await aio.gather(*coros)
