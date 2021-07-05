@@ -76,7 +76,7 @@ class AM43Cover(BLEQueueMixin, Device):
         ret = False
         if characteristic:
             self.clear_ble_queue()
-            await self.client.write_gatt_char(BLINDS_CONTROL, cmd, True)
+            await self.client.write_gatt_char(BLINDS_CONTROL, cmd)
             ret = True
             if wait_reply:
                 ble_notification = await aio.wait_for(
