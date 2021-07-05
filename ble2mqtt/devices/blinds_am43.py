@@ -35,7 +35,7 @@ class AM43State:
 
 class AM43Cover(BLEQueueMixin, Device):
     NAME = 'am43'
-    MANUFACTURER = 'Generic'
+    MANUFACTURER = 'Blind'
     DATA_CHAR = BLINDS_CONTROL
     ACTIVE_SLEEP_INTERVAL = 1
     SEND_DATA_PERIOD = 5
@@ -164,6 +164,12 @@ class AM43Cover(BLEQueueMixin, Device):
                 coros.append(publish_topic(
                     topic='/'.join((self.unique_id, cover['name'])),
                     value=json.dumps(cover_state),
+                ))
+                coros.append(publish_topic(
+                    topic='/'.join(
+                        (self.unique_id, cover['name'], self.POSITION_POSTFIX),
+                    ),
+                    value=self._state.position or '',
                 ))
         if coros:
             await aio.gather(*coros)

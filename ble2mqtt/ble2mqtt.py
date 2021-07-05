@@ -376,11 +376,11 @@ class DeviceManager:
                         entity_name,
                         device.SET_POSTFIX,
                     )
-                    # position_topic = self._get_topic(
-                    #     device.unique_id,
-                    #     entity_name,
-                    #     'position',
-                    # )
+                    position_topic = self._get_topic(
+                        device.unique_id,
+                        entity_name,
+                        'position',
+                    )
                     set_position_topic = self._get_topic(
                         device.unique_id,
                         entity_name,
@@ -396,10 +396,10 @@ class DeviceManager:
                     payload = json.dumps({
                         **get_generic_vals(entity),
                         'state_topic': state_topic,
-                        # 'position_topic': state_topic,
+                        'position_topic': position_topic,
                         'command_topic': set_topic,
                         'set_position_topic': set_position_topic,
-                        'position_template': '{{ value_json.position }}',
+                        # 'position_template': '{{ value_json.position }}',
                     })
                     logger.debug(
                         f'Publish config topic={config_topic}: {payload}',
