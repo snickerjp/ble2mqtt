@@ -66,6 +66,11 @@ class AM43Cover(BLEQueueMixin, Device):
         super().__init__(*args, **kwargs)
         self._state = AM43State()
 
+    def notification_callback(self, sender_handle: int, data: bytearray):
+        from ble2mqtt.utils import format_binary
+        logger.info(f'[{self}] BLE notification: {sender_handle}: {format_binary(data)}')
+        self._ble_queue.put_nowait((sender_handle, data))
+
     async def send_command(self, characteristic, id, data: list,
                            wait_reply=True, timeout=25):
         logger.info(f'[{self}] - send command {id:x}{data}')
