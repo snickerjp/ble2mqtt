@@ -7,6 +7,7 @@ from enum import Enum
 
 from ..protocols.base import BLEQueueMixin
 from .base import COVER_DOMAIN, Device
+from ..utils import format_binary
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +46,12 @@ class AM43Cover(BLEQueueMixin, Device):
     MAX_POSITION = 100
 
     # command IDs
-    CMD_MOVE = 0x0d
-    CMD_STOP = 0x0a
-    CMD_BATTERY = 0xa2
-    CMD_LIGHT = 0xaa
-    CMD_POSITION = 0xa7
+    CMD_MOVE = 0x0a
+    CMD_GET_BATTERY = 0xa2
+    CMD_GET_LIGHT = 0xaa
+    CMD_GET_POSITION = 0xa7
+    CMD_SET_POSITION = 0x0d
+    NOTIFY_POSITION = 0xa1
 
     @property
     def entities(self):
@@ -72,7 +74,7 @@ class AM43Cover(BLEQueueMixin, Device):
         self.process_data(data)
         self._ble_queue.put_nowait((sender_handle, data))
 
-    async def send_command(self, characteristic, id, data: list,
+    async def send_command(self, id, data: list,
                            wait_reply=True, timeout=25):
         logger.info(f'[{self}] - send command {id:x}{data}')
         cmd = bytearray([0x9a, id, len(data)] + data)
@@ -82,7 +84,7 @@ class AM43Cover(BLEQueueMixin, Device):
         cmd += bytearray([csum])
 
         ret = False
-        if characteristic:
+        if self.DATA_CHAR:
             self.clear_ble_queue()
             await self.client.write_gatt_char(BLINDS_CONTROL, cmd)
             ret = True
@@ -97,12 +99,12 @@ class AM43Cover(BLEQueueMixin, Device):
         return ret
 
     async def _request_position(self):
-        await self.send_command(self.DATA_CHAR, self.CMD_POSITION, [0x01], True)
+        await self.send_command(self.CMD_GET_POSITION, [0x01], True)
 
     async def _request_state(self):
         await self._request_position()
-        await self.send_command(self.DATA_CHAR, self.CMD_BATTERY, [0x01], True)
-        await self.send_command(self.DATA_CHAR, self.CMD_LIGHT, [0x01], True)
+        await self.send_command(self.CMD_GET_BATTERY, [0x01], True)
+        await self.send_command(self.CMD_GET_LIGHT, [0x01], True)
 
     async def get_device_data(self):
         await super().get_device_data()
@@ -113,14 +115,35 @@ class AM43Cover(BLEQueueMixin, Device):
         await self._request_state()
 
     def process_data(self, data: bytearray):
-        if data[1] == self.CMD_BATTERY:
+        if data[1] == self.CMD_GET_BATTERY:
+            # b'\x9a\xa2\x05\x00\x00\x00\x00Ql'
             self._state.battery = int(data[7])
-        elif data[1] == self.CMD_POSITION:
-            self._state.battery = int(data[5])
-        elif data[1] == self.CMD_LIGHT:
-            self._state.battery = int(data[4]) * 12.5
+        elif data[1] == self.NOTIFY_POSITION:
+            self._state.position = int(data[4])
+        elif data[1] == self.CMD_GET_POSITION:
+            # b'\x9a\xa7\x07\x0e2\x00\x00\x00\x0006'
+            # Bytes in this packet are:
+            #  3: Configuration flags, bits are:
+            #    1: direction
+            #    2: operation mode
+            #    3: top limit set
+            #    4: bottom limit set
+            #    5: has light sensor
+            #  4: Speed setting
+            #  5: Current position
+            #  6,7: Shade length.
+            #  8: Roller diameter.
+            #  9: Roller type.
+            #
+            self._state.position = int(data[5])
+        elif data[1] == self.CMD_GET_LIGHT:
+            # b'\x9a\xaa\x02\x00\x002'
+            self._state.light = int(data[4]) * 12.5
         else:
-            logger.error(f'{self} BLE notificationUnknown identifier not')
+            logger.error(
+                f'{self} BLE notification unknown response '
+                f'[{format_binary(data)}]',
+            )
 
     async def _notify_state(self, publish_topic):
         logger.info(f'[{self}] send state={self._state}')
@@ -180,6 +203,35 @@ class AM43Cover(BLEQueueMixin, Device):
                 timer = 0
             await aio.sleep(self.ACTIVE_SLEEP_INTERVAL)
 
+    async def _do_movement(self, movement_type, position):
+        if movement_type == 'open':
+            await self.send_command(self.CMD_MOVE, [0xdd])
+            self._state.run_state = RunState.OPENING
+        elif movement_type == 'close':
+            await self.send_command(self.CMD_MOVE, [0xee])
+            self._state.run_state = RunState.CLOSING
+        elif movement_type == 'position' and \
+                not position is None:
+            if 0 <= position <= 100:
+                await self.send_command(self.CMD_SET_POSITION, [int(position)])
+                if self._state.position < position:
+                    self._state.target_position = position
+                    self._state.run_state = RunState.CLOSING
+                elif self._state.position > position:
+                    self._state.target_position = position
+                    self._state.run_state = RunState.OPENING
+                else:
+                    self._state.target_position = None
+                    self._state.run_state = RunState.STOPPED
+            else:
+                logger.error(
+                    f'[{self}] Incorrect position value: '
+                    f'{repr(position)}',
+                )
+        else:
+            await self.send_command(self.CMD_MOVE, [0xcc])
+            self._state.run_state = RunState.STOPPED
+
     async def handle_messages(self, publish_topic, *args, **kwargs):
         while True:
             try:
@@ -196,55 +248,32 @@ class AM43Cover(BLEQueueMixin, Device):
             entity_name, postfix = self.get_entity_from_topic(message['topic'])
             if entity_name == COVER_ENTITY:
                 value = self.transform_value(value)
-                target_value = None
+                target_position = None
                 if postfix == self.SET_POSTFIX:
                     logger.info(
                         f'[{self}] set mode {entity_name} value={value}',
                     )
                     if value.lower() == 'open':
-                        target_value = self.MIN_POSITION
+                        movement_type = 'open'
                     elif value.lower() == 'close':
-                        target_value = self.MAX_POSITION
-                    # assume that rest is 'stop'
+                        movement_type = 'close'
+                    else:
+                        movement_type = 'stop'
                 elif postfix == self.POSITION_POSTFIX:
+                    movement_type = 'position'
                     logger.info(
                         f'[{self}] set position {entity_name} value={value}',
                     )
                     try:
-                        target_value = int(value)
+                        target_position = int(value)
                     except ValueError:
                         pass
+                else:
+                    raise NotImplementedError()
+
                 while True:
                     try:
-                        if target_value is None:
-                            await self.send_command(
-                                self.DATA_CHAR,
-                                self.CMD_STOP,
-                                [0xcc],
-                            )
-                            self._state.run_state = RunState.STOPPED
-
-                        elif 0 <= target_value <= 100:
-                            await self.send_command(
-                                self.DATA_CHAR,
-                                self.CMD_MOVE,
-                                [int(target_value)],
-                            )
-                            if self._state.position < target_value:
-                                self._state.target_position = target_value
-                                self._state.run_state = RunState.CLOSING
-                            elif self._state.position > target_value:
-                                self._state.target_position = target_value
-                                self._state.run_state = RunState.OPENING
-                            else:
-                                self._state.target_position = None
-                                self._state.run_state = RunState.STOPPED
-                        else:
-                            logger.error(
-                                f'[{self}] Incorrect position value: '
-                                f'{repr(target_value)}',
-                            )
-
+                        await self._do_movement(movement_type, target_position)
                         await self._notify_state(publish_topic)
                         break
                     except ConnectionError as e:
