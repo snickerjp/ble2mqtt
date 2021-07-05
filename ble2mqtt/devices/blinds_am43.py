@@ -67,8 +67,9 @@ class AM43Cover(BLEQueueMixin, Device):
         self._state = AM43State()
 
     def notification_callback(self, sender_handle: int, data: bytearray):
-        from ble2mqtt.utils import format_binary
-        logger.info(f'[{self}] BLE notification: {sender_handle}: {format_binary(data)}')
+        # from ble2mqtt.utils import format_binary
+        # logger.info(f'[{self}] BLE notification: {sender_handle}: {format_binary(data)}')
+        self.process_data(data)
         self._ble_queue.put_nowait((sender_handle, data))
 
     async def send_command(self, characteristic, id, data: list,
@@ -150,7 +151,6 @@ class AM43Cover(BLEQueueMixin, Device):
 
         timer = 0
         while True:
-            logger.info(f'[{self}] send config')
             await self.update_device_data(send_config)
             # if running notify every 5 seconds, 60 sec otherwise
             is_running = self._state.run_state in [
