@@ -200,14 +200,12 @@ class AM43Cover(BLEQueueMixin, Device):
                 if is_running:
                     logger.info(f'[{self}] check for position')
                     await self._request_position()
-                    if self._state.run_state == RunState.CLOSING and \
-                            self._state.position == self.MAX_POSITION:
+                    if self._state.position == self.MAX_POSITION:
                         logger.info(
                             f'[{self}] Maximum position reached. Set to CLOSED',
                         )
                         self._state.run_state = RunState.CLOSED
-                    elif self._state.run_state == RunState.OPENING and \
-                            self._state.position == self.MIN_POSITION:
+                    elif self._state.position == self.MIN_POSITION:
                         logger.info(
                             f'[{self}] Minimum position reached. Set to OPENED',
                         )
@@ -219,29 +217,37 @@ class AM43Cover(BLEQueueMixin, Device):
                 timer = 0
             await aio.sleep(self.ACTIVE_SLEEP_INTERVAL)
 
-    async def _do_movement(self, movement_type, position):
+    async def _do_movement(self, movement_type, target_position):
         if movement_type == 'open':
             await self.send_command(self.CMD_MOVE, [0xdd])
             self._state.run_state = RunState.OPENING
         elif movement_type == 'close':
             await self.send_command(self.CMD_MOVE, [0xee])
             self._state.run_state = RunState.CLOSING
-        elif movement_type == 'position' and position is not None:
-            if 0 <= position <= 100:
-                await self.send_command(self.CMD_SET_POSITION, [int(position)])
-                if self._state.position < position:
-                    self._state.target_position = position
+        elif movement_type == 'position' and target_position is not None:
+            if 0 <= target_position <= 100:
+                await self.send_command(
+                    self.CMD_SET_POSITION,
+                    [int(target_position)],
+                )
+                if self._state.position < target_position:
+                    self._state.target_position = target_position
                     self._state.run_state = RunState.CLOSING
-                elif self._state.position > position:
-                    self._state.target_position = position
+                elif self._state.position > target_position:
+                    self._state.target_position = target_position
                     self._state.run_state = RunState.OPENING
                 else:
                     self._state.target_position = None
-                    self._state.run_state = RunState.STOPPED
+                    if target_position == 0:
+                        self._state.run_state = RunState.OPEN
+                    elif target_position == 100:
+                        self._state.run_state = RunState.CLOSED
+                    else:
+                        self._state.run_state = RunState.STOPPED
             else:
                 logger.error(
                     f'[{self}] Incorrect position value: '
-                    f'{repr(position)}',
+                    f'{repr(target_position)}',
                 )
         else:
             await self.send_command(self.CMD_MOVE, [0xcc])
