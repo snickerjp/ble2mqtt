@@ -29,7 +29,7 @@ class AM43State:
     battery: int = None
     position: int = 0
     light: int = None
-    run_state: RunState = RunState.STOPPED
+    run_state: RunState = RunState.CLOSED
     target_position: int = None
 
 
@@ -43,8 +43,9 @@ class AM43Cover(BLEQueueMixin, Device):
     STANDBY_SEND_DATA_PERIOD_MULTIPLIER = 4
     LINKQUALITY_TOPIC = COVER_ENTITY
 
-    MIN_POSITION = 0
-    MAX_POSITION = 100
+    # HA notation. We convert value on setting and receiving data
+    CLOSED_POSITION = 0
+    OPEN_POSITION = 100
 
     # command IDs
     CMD_MOVE = 0x0a
@@ -66,7 +67,6 @@ class AM43Cover(BLEQueueMixin, Device):
                 {
                     'name': COVER_ENTITY,
                     'device_class': 'shade',
-                    'inverse': True,
                 },
             ],
         }
@@ -79,6 +79,10 @@ class AM43Cover(BLEQueueMixin, Device):
     def notification_callback(self, sender_handle: int, data: bytearray):
         self.process_data(data)
         self._ble_queue.put_nowait((sender_handle, data))
+
+    @staticmethod
+    def _convert_position(value):
+        return 100 - value
 
     async def send_command(self, id, data: list,
                            wait_reply=True, timeout=25):
@@ -105,6 +109,13 @@ class AM43Cover(BLEQueueMixin, Device):
     async def _request_position(self):
         await self.send_command(self.CMD_GET_POSITION, [0x01], True)
 
+    async def _set_position(self, value):
+        await self.send_command(
+            self.CMD_SET_POSITION,
+            [self._convert_position(int(value))],
+            True,
+        )
+
     async def _request_state(self):
         await self._request_position()
         await self.send_command(self.CMD_GET_BATTERY, [0x01], True)
@@ -123,7 +134,7 @@ class AM43Cover(BLEQueueMixin, Device):
             # b'\x9a\xa2\x05\x00\x00\x00\x00Ql'
             self._state.battery = int(data[7])
         elif data[1] == self.NOTIFY_POSITION:
-            self._state.position = int(data[4])
+            self._state.position = self._convert_position(int(data[4]))
         elif data[1] == self.CMD_GET_POSITION:
             # [9a a7 07 0e 32 00 00 00 00 30 36]
             # Bytes in this packet are:
@@ -139,7 +150,7 @@ class AM43Cover(BLEQueueMixin, Device):
             #  8: Roller diameter.
             #  9: Roller type.
 
-            self._state.position = int(data[5])
+            self._state.position = self._convert_position(int(data[5]))
         elif data[1] == self.CMD_GET_LIGHT:
             # b'\x9a\xaa\x02\x00\x002'
             self._state.light = int(data[4]) * 12.5
@@ -200,12 +211,12 @@ class AM43Cover(BLEQueueMixin, Device):
                 if is_running:
                     logger.info(f'[{self}] check for position')
                     await self._request_position()
-                    if self._state.position == self.MAX_POSITION:
+                    if self._state.position == self.CLOSED_POSITION:
                         logger.info(
                             f'[{self}] Maximum position reached. Set to CLOSED',
                         )
                         self._state.run_state = RunState.CLOSED
-                    elif self._state.position == self.MIN_POSITION:
+                    elif self._state.position == self.OPEN_POSITION:
                         logger.info(
                             f'[{self}] Minimum position reached. Set to OPENED',
                         )
@@ -225,11 +236,8 @@ class AM43Cover(BLEQueueMixin, Device):
             await self.send_command(self.CMD_MOVE, [0xee])
             self._state.run_state = RunState.CLOSING
         elif movement_type == 'position' and target_position is not None:
-            if 0 <= target_position <= 100:
-                await self.send_command(
-                    self.CMD_SET_POSITION,
-                    [int(target_position)],
-                )
+            if self.CLOSED_POSITION <= target_position <= self.OPEN_POSITION:
+                await self._set_position(target_position)
                 if self._state.position < target_position:
                     self._state.target_position = target_position
                     self._state.run_state = RunState.CLOSING
@@ -238,9 +246,9 @@ class AM43Cover(BLEQueueMixin, Device):
                     self._state.run_state = RunState.OPENING
                 else:
                     self._state.target_position = None
-                    if target_position == 0:
+                    if target_position == self.OPEN_POSITION:
                         self._state.run_state = RunState.OPEN
-                    elif target_position == 100:
+                    elif target_position == self.CLOSED_POSITION:
                         self._state.run_state = RunState.CLOSED
                     else:
                         self._state.run_state = RunState.STOPPED
@@ -276,10 +284,10 @@ class AM43Cover(BLEQueueMixin, Device):
                     )
                     if value.lower() == 'open':
                         movement_type = 'position'
-                        target_position = 0
+                        target_position = self.OPEN_POSITION
                     elif value.lower() == 'close':
                         movement_type = 'position'
-                        target_position = 100
+                        target_position = self.CLOSED_POSITION
                     else:
                         movement_type = 'stop'
                 elif postfix == self.SET_POSITION_POSTFIX:

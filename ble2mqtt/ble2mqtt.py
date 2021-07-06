@@ -235,7 +235,6 @@ class DeviceManager:
             entity.pop('topic', None)
             entity.pop('json', None)
             entity.pop('main_value', None)
-            entity.pop('inverse', None)  # covers
             result.update(entity)
             return result
 
@@ -403,11 +402,6 @@ class DeviceManager:
                         'command_topic': set_topic,
                         'set_position_topic': set_position_topic,
                     }
-                    if entity.get('inverse', False):
-                        config_params.update({
-                            'position_open': 0,
-                            'position_closed': 100,
-                        })
                     payload = json.dumps(config_params)
                     logger.debug(
                         f'Publish config topic={config_topic}: {payload}',
