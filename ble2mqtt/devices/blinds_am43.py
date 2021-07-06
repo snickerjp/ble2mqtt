@@ -274,9 +274,11 @@ class AM43Cover(BLEQueueMixin, Device):
                         f'[{self}] set mode {entity_name} value={value}',
                     )
                     if value.lower() == 'open':
-                        movement_type = 'open'
+                        movement_type = 'position'
+                        target_position = 0
                     elif value.lower() == 'close':
-                        movement_type = 'close'
+                        movement_type = 'position'
+                        target_position = 100
                     else:
                         movement_type = 'stop'
                 elif postfix == self.POSITION_POSTFIX:
