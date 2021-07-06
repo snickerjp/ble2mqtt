@@ -39,8 +39,7 @@ class AM43Cover(BLEQueueMixin, Device):
     DATA_CHAR = BLINDS_CONTROL
     ACTIVE_SLEEP_INTERVAL = 1
     SEND_DATA_PERIOD = 5
-    # STANDBY_SEND_DATA_PERIOD_MULTIPLIER = 12 * 5  # 5 minutes
-    STANDBY_SEND_DATA_PERIOD_MULTIPLIER = 4
+    STANDBY_SEND_DATA_PERIOD_MULTIPLIER = 12 * 5  # 5 minutes
     LINKQUALITY_TOPIC = COVER_ENTITY
 
     # HA notation. We convert value on setting and receiving data
@@ -96,7 +95,7 @@ class AM43Cover(BLEQueueMixin, Device):
 
     async def send_command(self, id, data: list,
                            wait_reply=True, timeout=25):
-        logger.info(f'[{self}] - send command 0x{id:x} {data}')
+        logger.debug(f'[{self}] - send command 0x{id:x} {data}')
         cmd = bytearray([0x9a, id, len(data)] + data)
         csum = 0
         for x in cmd:
@@ -107,12 +106,12 @@ class AM43Cover(BLEQueueMixin, Device):
         await self.client.write_gatt_char(BLINDS_CONTROL, cmd)
         ret = None
         if wait_reply:
-            logger.info(f'[{self}] waiting for reply')
+            logger.debug(f'[{self}] waiting for reply')
             ble_notification = await aio.wait_for(
                 self.ble_get_notification(),
                 timeout=timeout,
             )
-            logger.info(f'[{self}] reply: {ble_notification[1]}')
+            logger.debug(f'[{self}] reply: {ble_notification[1]}')
             ret = bytes(ble_notification[1][3:-1])
         return ret
 
@@ -219,7 +218,7 @@ class AM43Cover(BLEQueueMixin, Device):
             timer += self.ACTIVE_SLEEP_INTERVAL
             if timer >= self.SEND_DATA_PERIOD * multiplier:
                 if is_running:
-                    logger.info(f'[{self}] check for position')
+                    logger.debug(f'[{self}] check for position')
                     await self._request_position()
                     if self._state.position == self.CLOSED_POSITION:
                         logger.info(
@@ -228,11 +227,11 @@ class AM43Cover(BLEQueueMixin, Device):
                         self._state.run_state = RunState.CLOSED
                     elif self._state.position == self.OPEN_POSITION:
                         logger.info(
-                            f'[{self}] Maximum position reached. Set to OPENED',
+                            f'[{self}] Maximum position reached. Set to OPEN',
                         )
                         self._state.run_state = RunState.OPEN
                 else:
-                    logger.info(f'[{self}] check for full state')
+                    logger.debug(f'[{self}] check for full state')
                     await self._request_state()
                 await self._notify_state(publish_topic)
                 timer = 0
