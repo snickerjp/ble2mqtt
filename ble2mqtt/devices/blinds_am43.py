@@ -223,12 +223,12 @@ class AM43Cover(BLEQueueMixin, Device):
                     await self._request_position()
                     if self._state.position == self.CLOSED_POSITION:
                         logger.info(
-                            f'[{self}] Maximum position reached. Set to CLOSED',
+                            f'[{self}] Minimum position reached. Set to CLOSED',
                         )
                         self._state.run_state = RunState.CLOSED
                     elif self._state.position == self.OPEN_POSITION:
                         logger.info(
-                            f'[{self}] Minimum position reached. Set to OPENED',
+                            f'[{self}] Maximum position reached. Set to OPENED',
                         )
                         self._state.run_state = RunState.OPEN
                 else:
@@ -248,10 +248,10 @@ class AM43Cover(BLEQueueMixin, Device):
         elif movement_type == 'position' and target_position is not None:
             if self.CLOSED_POSITION <= target_position <= self.OPEN_POSITION:
                 await self._set_position(target_position)
-                if self._state.position < target_position:
+                if self._state.position > target_position:
                     self._state.target_position = target_position
                     self._state.run_state = RunState.CLOSING
-                elif self._state.position > target_position:
+                elif self._state.position < target_position:
                     self._state.target_position = target_position
                     self._state.run_state = RunState.OPENING
                 else:
