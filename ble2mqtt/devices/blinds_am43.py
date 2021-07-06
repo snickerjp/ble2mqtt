@@ -75,33 +75,29 @@ class AM43Cover(BLEQueueMixin, Device):
         self._state = AM43State()
 
     def notification_callback(self, sender_handle: int, data: bytearray):
-        # from ble2mqtt.utils import format_binary
-        # logger.info(f'[{self}] BLE notification: {sender_handle}: {format_binary(data)}')
         self.process_data(data)
         self._ble_queue.put_nowait((sender_handle, data))
 
     async def send_command(self, id, data: list,
                            wait_reply=True, timeout=25):
-        logger.info(f'[{self}] - send command {id:x}{data}')
+        logger.info(f'[{self}] - send command 0x{id:x} {data}')
         cmd = bytearray([0x9a, id, len(data)] + data)
         csum = 0
         for x in cmd:
             csum = csum ^ x
         cmd += bytearray([csum])
 
-        ret = False
-        if self.DATA_CHAR:
-            self.clear_ble_queue()
-            await self.client.write_gatt_char(BLINDS_CONTROL, cmd)
-            ret = True
-            if wait_reply:
-                logger.info(f'[{self}] waiting for reply')
-                ble_notification = await aio.wait_for(
-                    self.ble_get_notification(),
-                    timeout=timeout,
-                )
-                logger.info(f'[{self}] reply: {ble_notification[1]}')
-                ret = bytes(ble_notification[1][3:-1])
+        self.clear_ble_queue()
+        await self.client.write_gatt_char(BLINDS_CONTROL, cmd)
+        ret = None
+        if wait_reply:
+            logger.info(f'[{self}] waiting for reply')
+            ble_notification = await aio.wait_for(
+                self.ble_get_notification(),
+                timeout=timeout,
+            )
+            logger.info(f'[{self}] reply: {ble_notification[1]}')
+            ret = bytes(ble_notification[1][3:-1])
         return ret
 
     async def _request_position(self):
@@ -140,7 +136,7 @@ class AM43Cover(BLEQueueMixin, Device):
             #  6,7: Shade length.
             #  8: Roller diameter.
             #  9: Roller type.
-            #
+
             self._state.position = int(data[5])
         elif data[1] == self.CMD_GET_LIGHT:
             # b'\x9a\xaa\x02\x00\x002'
