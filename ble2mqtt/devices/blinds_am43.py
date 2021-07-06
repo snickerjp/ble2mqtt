@@ -7,7 +7,7 @@ from enum import Enum
 
 from ..protocols.base import BLEQueueMixin
 from ..utils import format_binary
-from .base import COVER_DOMAIN, Device
+from .base import COVER_DOMAIN, SENSOR_DOMAIN, Device
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,16 @@ class AM43Cover(BLEQueueMixin, Device):
                 {
                     'name': COVER_ENTITY,
                     'device_class': 'shade',
+                },
+            ],
+            SENSOR_DOMAIN: [
+                {
+                    'name': 'battery',
+                    'device_class': 'battery',
+                    'unit_of_measurement': '%',
+                    'topic': 'cover',
+                    'json': True,
+                    'main_value': 'battery',
                 },
             ],
         }
