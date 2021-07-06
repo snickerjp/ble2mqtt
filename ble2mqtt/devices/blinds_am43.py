@@ -175,12 +175,6 @@ class AM43Cover(BLEQueueMixin, Device):
                     topic='/'.join((self.unique_id, cover['name'])),
                     value=json.dumps(cover_state),
                 ))
-                coros.append(publish_topic(
-                    topic='/'.join(
-                        (self.unique_id, cover['name'], self.POSITION_POSTFIX),
-                    ),
-                    value=self._state.position,
-                ))
         if coros:
             await aio.gather(*coros)
 
@@ -282,7 +276,7 @@ class AM43Cover(BLEQueueMixin, Device):
                         target_position = 100
                     else:
                         movement_type = 'stop'
-                elif postfix == self.POSITION_POSTFIX:
+                elif postfix == self.SET_POSITION_POSTFIX:
                     movement_type = 'position'
                     logger.info(
                         f'[{self}] set position {entity_name} value={value}',

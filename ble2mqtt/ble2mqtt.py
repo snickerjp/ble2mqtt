@@ -389,7 +389,7 @@ class DeviceManager:
                     set_position_topic = self._get_topic(
                         device.unique_id,
                         entity_name,
-                        'set_position',
+                        device.SET_POSITION_POSTFIX,
                     )
                     config_topic = '/'.join((
                         CONFIG_MQTT_NAMESPACE,

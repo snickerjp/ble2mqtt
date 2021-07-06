@@ -118,7 +118,7 @@ class BaseDevice(metaclass=RegisteredType):
 class Device(BaseDevice, abc.ABC):
     MQTT_VALUES = None
     SET_POSTFIX = 'set'
-    POSITION_POSTFIX = 'position'  # for covers. Consider rework
+    SET_POSITION_POSTFIX = 'set_position'  # for covers. Consider rework
     MAC_TYPE = 'public'
     MANUFACTURER = None
     CONNECTION_FAILURES_LIMIT = 100
@@ -153,7 +153,7 @@ class Device(BaseDevice, abc.ABC):
         subtopic = None
         if topic.startswith(self.unique_id):
             topic = topic[len(self.unique_id):]
-        for postfix in [self.SET_POSTFIX, self.POSITION_POSTFIX]:
+        for postfix in [self.SET_POSTFIX, self.SET_POSITION_POSTFIX]:
             if topic.endswith(postfix):
                 subtopic = postfix
                 topic = topic[:-len(postfix)]
@@ -168,7 +168,7 @@ class Device(BaseDevice, abc.ABC):
             for entity in items
             if cls in [SWITCH_DOMAIN, LIGHT_DOMAIN, COVER_DOMAIN]
         ] + [
-            f'{self.unique_id}/{entity["name"]}/{self.POSITION_POSTFIX}'
+            f'{self.unique_id}/{entity["name"]}/{self.SET_POSITION_POSTFIX}'
             for cls, items in self.entities.items()
             for entity in items
             if cls in [COVER_DOMAIN]
