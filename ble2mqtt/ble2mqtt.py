@@ -381,11 +381,6 @@ class DeviceManager:
                         entity_name,
                         device.SET_POSTFIX,
                     )
-                    # position_topic = self._get_topic(
-                    #     device.unique_id,
-                    #     entity_name,
-                    #     'position',
-                    # )
                     set_position_topic = self._get_topic(
                         device.unique_id,
                         entity_name,

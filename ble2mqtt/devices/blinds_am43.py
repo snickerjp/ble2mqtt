@@ -17,7 +17,7 @@ BLINDS_CONTROL = uuid.UUID("0000fe51-0000-1000-8000-00805f9b34fb")
 
 
 class RunState(Enum):
-    OPENED = 'opened'
+    OPEN = 'open'
     OPENING = 'opening'
     CLOSED = 'closed'
     CLOSING = 'closing'
@@ -211,7 +211,7 @@ class AM43Cover(BLEQueueMixin, Device):
                         logger.info(
                             f'[{self}] Minimum position reached. Set to OPENED',
                         )
-                        self._state.run_state = RunState.OPENED
+                        self._state.run_state = RunState.OPEN
                 else:
                     logger.info(f'[{self}] check for full state')
                     await self._request_state()
