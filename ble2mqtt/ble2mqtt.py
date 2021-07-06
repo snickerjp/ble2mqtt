@@ -235,6 +235,7 @@ class DeviceManager:
             entity.pop('topic', None)
             entity.pop('json', None)
             entity.pop('main_value', None)
+            entity.pop('inverse', None)  # covers
             result.update(entity)
             return result
 
@@ -376,11 +377,11 @@ class DeviceManager:
                         entity_name,
                         device.SET_POSTFIX,
                     )
-                    position_topic = self._get_topic(
-                        device.unique_id,
-                        entity_name,
-                        'position',
-                    )
+                    # position_topic = self._get_topic(
+                    #     device.unique_id,
+                    #     entity_name,
+                    #     'position',
+                    # )
                     set_position_topic = self._get_topic(
                         device.unique_id,
                         entity_name,
@@ -393,14 +394,22 @@ class DeviceManager:
                         entity_name,
                         'config',
                     ))
-                    payload = json.dumps({
+                    config_params = {
                         **get_generic_vals(entity),
                         'state_topic': state_topic,
-                        'position_topic': position_topic,
+                        'position_topic': state_topic,
+                        'json_attributes_topic': state_topic,
+                        'value_template': '{{ value_json.state }}',
+                        'position_template': '{{ value_json.position }}',
                         'command_topic': set_topic,
                         'set_position_topic': set_position_topic,
-                        # 'position_template': '{{ value_json.position }}',
-                    })
+                    }
+                    if entity.get('inverse', False):
+                        config_params.update({
+                            'position_open': 0,
+                            'position_closed': 100,
+                        })
+                    payload = json.dumps(config_params)
                     logger.debug(
                         f'Publish config topic={config_topic}: {payload}',
                     )

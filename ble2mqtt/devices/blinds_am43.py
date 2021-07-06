@@ -65,6 +65,7 @@ class AM43Cover(BLEQueueMixin, Device):
                 {
                     'name': COVER_ENTITY,
                     'device_class': 'shade',
+                    'inverse': True,
                 },
             ],
         }
