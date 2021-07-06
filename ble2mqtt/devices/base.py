@@ -125,6 +125,7 @@ class Device(BaseDevice, abc.ABC):
     RECONNECTION_SLEEP_INTERVAL = 60
     ACTIVE_SLEEP_INTERVAL = 60
     PASSIVE_SLEEP_INTERVAL = 60
+    LINKQUALITY_TOPIC = None
 
     # secs to sleep if not connected or no data in passive mode
     NOT_READY_SLEEP_INTERVAL = 5

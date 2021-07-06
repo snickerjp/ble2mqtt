@@ -246,6 +246,10 @@ class DeviceManager:
                 'name': 'linkquality',
                 'unit_of_measurement': 'lqi',
                 'icon': 'signal',
+                **(
+                    {'topic': device.LINKQUALITY_TOPIC}
+                    if device.LINKQUALITY_TOPIC else {}
+                ),
             },
         )
         entities = {
