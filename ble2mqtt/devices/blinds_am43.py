@@ -125,7 +125,7 @@ class AM43Cover(BLEQueueMixin, Device):
         elif data[1] == self.NOTIFY_POSITION:
             self._state.position = int(data[4])
         elif data[1] == self.CMD_GET_POSITION:
-            # b'\x9a\xa7\x07\x0e2\x00\x00\x00\x0006'
+            # [9a a7 07 0e 32 00 00 00 00 30 36]
             # Bytes in this packet are:
             #  3: Configuration flags, bits are:
             #    1: direction
@@ -143,7 +143,7 @@ class AM43Cover(BLEQueueMixin, Device):
         elif data[1] == self.CMD_GET_LIGHT:
             # b'\x9a\xaa\x02\x00\x002'
             self._state.light = int(data[4]) * 12.5
-        elif data[1] == self.CMD_MOVE:
+        elif data[1] in [self.CMD_MOVE, self.CMD_SET_POSITION]:
             if data[3] != self.AM43_RESPONSE_ACK:
                 logger.error(f'[{self}] Problem with moving: NACK')
         elif data[1] in [self.AM43_REPLY_UNKNOWN1, self.AM43_REPLY_UNKNOWN2]:
