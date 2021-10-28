@@ -2,13 +2,16 @@ import asyncio as aio
 import json
 import logging
 import os
-import signal
+# import signal
+import faulthandler
+
+faulthandler.enable()
 
 from ble2mqtt.__version__ import VERSION
 
-from .bleak_patch import add_bluepy_backend
+from .bleak_gattlib import add_gattlib_backend
 
-add_bluepy_backend()
+add_gattlib_backend()
 
 from ble2mqtt.ble2mqtt import Ble2Mqtt
 
@@ -19,28 +22,28 @@ logger = logging.getLogger(__name__)
 is_shutting_down: aio.Lock = aio.Lock()
 
 
-async def shutdown(loop, service: Ble2Mqtt, signal=None):
-    """Cleanup tasks tied to the service's shutdown."""
-    if is_shutting_down.locked():
-        return
-    async with is_shutting_down:
-        if signal:
-            logger.info(f"Received exit signal {signal.name}...")
-        logger.info("Closing ble2mqtt service")
-        await service.close()
-        tasks = [t for t in aio.all_tasks() if t is not aio.current_task()]
-
-        [task.cancel() for task in tasks]
-
-        logger.info(f"Cancelling {len(tasks)} outstanding tasks")
-        try:
-            await aio.wait_for(
-                aio.gather(*tasks, return_exceptions=True),
-                timeout=10,
-            )
-        except (Exception, aio.CancelledError):
-            logger.exception(f'Cancelling caused error: {tasks}')
-        loop.stop()
+# async def shutdown(loop, service: Ble2Mqtt, signal=None):
+#     """Cleanup tasks tied to the service's shutdown."""
+#     if is_shutting_down.locked():
+#         return
+#     async with is_shutting_down:
+#         if signal:
+#             logger.info(f"Received exit signal {signal.name}...")
+#         logger.info("Closing ble2mqtt service")
+#         await service.close()
+#         tasks = [t for t in aio.all_tasks() if t is not aio.current_task()]
+#
+#         [task.cancel() for task in tasks]
+#
+#         logger.info(f"Cancelling {len(tasks)} outstanding tasks")
+#         try:
+#             await aio.wait_for(
+#                 aio.gather(*tasks, return_exceptions=True),
+#                 timeout=10,
+#             )
+#         except (Exception, aio.CancelledError):
+#             logger.exception(f'Cancelling caused error: {tasks}')
+#         loop.stop()
 
 
 def handle_exception(loop, context, service):
@@ -74,36 +77,16 @@ def handle_exception(loop, context, service):
         return
 
     logger.info("Shutting down...")
-    aio.create_task(shutdown(loop, service))
+    # aio.create_task(shutdown(loop, service))
 
 
-def main():
-    os.environ.setdefault('BLE2MQTT_CONFIG', '/etc/ble2mqtt.json')
-    config = {}
-    if os.path.exists(os.environ['BLE2MQTT_CONFIG']):
-        try:
-            with open(os.environ['BLE2MQTT_CONFIG'], 'r') as f:
-                config = json.load(f)
-        except FileNotFoundError:
-            pass
-
-    config = {
-        'mqtt_host': 'localhost',
-        'mqtt_port': 1883,
-        'base_topic': 'ble2mqtt',
-        'mqtt_config_prefix': 'b2m_',
-        'log_level': 'INFO',
-        **config,
-    }
-
-    logging.basicConfig(level=config['log_level'].upper())
-    # logging.getLogger('bleak.backends.bluezdbus.scanner').setLevel('INFO')
-    logger.info(f'Starting BLE2MQTT version {VERSION}')
-    loop = aio.get_event_loop()
+async def amain(config):
+    loop = aio.get_running_loop()
 
     service = Ble2Mqtt(
         reconnection_interval=10,
         loop=loop,
+        hci_device=config['hci_device'],
         host=config['mqtt_host'],
         port=config['mqtt_port'],
         user=config.get('mqtt_user'),
@@ -112,12 +95,12 @@ def main():
         mqtt_config_prefix=config['mqtt_config_prefix'],
     )
 
-    signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
-    for sig in signals:
-        loop.add_signal_handler(
-            sig,
-            lambda s=sig: aio.create_task(shutdown(loop, service, s)),
-        )
+    # signals = (signal.SIGHUP, signal.SIGTERM, signal.SIGINT)
+    # for sig in signals:
+    #     loop.add_signal_handler(
+    #         sig,
+    #         lambda s=sig: aio.create_task(shutdown(loop, service, s)),
+    #     )
     loop.set_exception_handler(
         lambda *args: handle_exception(*args, service=service),
     )
@@ -138,13 +121,37 @@ def main():
         )
 
     try:
-        loop.create_task(service.start())
-        loop.run_forever()
+        await service.start()
     finally:
-        loop.run_until_complete(service.close())
-        loop.run_until_complete(loop.shutdown_asyncgens())
-        loop.close()
-        logger.info('Bye.')
+        await service.close()
+
+
+def main():
+    os.environ.setdefault('BLE2MQTT_CONFIG', '/etc/ble2mqtt.json')
+    config = {}
+    if os.path.exists(os.environ['BLE2MQTT_CONFIG']):
+        try:
+            with open(os.environ['BLE2MQTT_CONFIG'], 'r') as f:
+                config = json.load(f)
+        except FileNotFoundError:
+            pass
+
+    config = {
+        'mqtt_host': 'localhost',
+        'mqtt_port': 1883,
+        'base_topic': 'ble2mqtt',
+        'mqtt_config_prefix': 'b2m_',
+        'log_level': 'INFO',
+        'hci_device': 'hci0',
+        **config,
+    }
+
+    logging.basicConfig(level=config['log_level'].upper())
+    # logging.getLogger('bleak.backends.bluezdbus.scanner').setLevel('INFO')
+    logger.info(f'Starting BLE2MQTT version {VERSION}')
+
+    aio.run(amain(config), debug=True)
+    logger.info('Bye.')
 
 
 if __name__ == '__main__':

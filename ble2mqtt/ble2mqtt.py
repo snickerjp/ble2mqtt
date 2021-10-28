@@ -34,7 +34,7 @@ ListOfConnectionErrors = (
 )
 
 
-BLUETOOTH_RESTARTING = aio.Lock()
+BLUETOOTH_RESTARTING = None  # initialize in a loop
 
 
 async def run_tasks_and_cancel_on_first_return(*tasks: aio.Future,
@@ -117,6 +117,8 @@ async def handle_returned_tasks(*tasks: aio.Future):
 def hardware_exception_occurred(exception):
     ex_str = str(exception)
     return (
+        'Invalid device!' in ex_str or
+
         'org.freedesktop.DBus.Error.ServiceUnknown' in ex_str or
         'org.freedesktop.DBus.Error.NoReply' in ex_str or
         'org.freedesktop.DBus.Error.AccessDenied' in ex_str or
@@ -134,23 +136,26 @@ ListOfMQTTConnectionErrors = (
 )
 
 
-async def restart_bluetooth():
+async def restart_bluetooth(hci_device):
     if BLUETOOTH_RESTARTING.locked():
         await aio.sleep(9)
         return
     async with BLUETOOTH_RESTARTING:
         logger.warning('Restarting bluetoothd...')
         proc = await aio.create_subprocess_exec(
-            'hciconfig', 'hci0', 'down',
+            'hciconfig', hci_device, 'down',
         )
         await proc.wait()
+        # proc = await aio.create_subprocess_exec(
+        #     '/etc/init.d/bluetoothd', 'restart',
+        # )
         proc = await aio.create_subprocess_exec(
-            '/etc/init.d/bluetoothd', 'restart',
+            'hciconfig', hci_device, 'reset',
         )
         await proc.wait()
         await aio.sleep(3)
         proc = await aio.create_subprocess_exec(
-            'hciconfig', 'hci0', 'up',
+            'hciconfig', hci_device, 'up',
         )
         await proc.wait()
         await aio.sleep(5)
@@ -158,21 +163,23 @@ async def restart_bluetooth():
 
 
 @asynccontextmanager
-async def handle_ble_exceptions():
+async def handle_ble_exceptions(hci_device):
     try:
         yield
     except ListOfConnectionErrors as e:
         if hardware_exception_occurred(e):
-            await restart_bluetooth()
+            await restart_bluetooth(hci_device)
             await aio.sleep(3)
         raise
 
 
 class DeviceManager:
-    def __init__(self, device, *, mqtt_client, base_topic, config_prefix):
+    def __init__(self, device, *, mqtt_client, base_topic, config_prefix,
+                 hci_device):
         self.device: Device = device
         self._mqtt_client = mqtt_client
         self._base_topic = base_topic
+        self._hci_device = hci_device
         self._config_prefix = config_prefix
         self.manage_task = None
 
@@ -481,8 +488,8 @@ class DeviceManager:
             async with BLUETOOTH_RESTARTING:
                 logger.debug(f'[{device}] Check for lock')
             try:
-                async with handle_ble_exceptions():
-                    await device.connect()
+                async with handle_ble_exceptions(self._hci_device):
+                    await device.connect(self._hci_device)
                     initial_coros = []
                     if not device.is_passive:
                         if not device.DEVICE_DROPS_CONNECTION:
@@ -565,7 +572,7 @@ class DeviceManager:
                         f'{missing_device_count} times. Restarting bluetooth.',
                     )
                     missing_device_count = 0
-                    await restart_bluetooth()
+                    await restart_bluetooth(self._hci_device)
             finally:
                 try:
                     await aio.wait_for(device.close(), timeout=10)
@@ -590,7 +597,7 @@ class DeviceManager:
                     pass
 
             if failure_count >= FAILURE_LIMIT:
-                await restart_bluetooth()
+                await restart_bluetooth(self._hci_device)
                 failure_count = 0
             try:
                 if not device.disconnected_event.is_set():
@@ -622,16 +629,22 @@ class Ble2Mqtt:
             *,
             base_topic,
             mqtt_config_prefix,
+            hci_device: str,
     ) -> None:
+        global BLUETOOTH_RESTARTING
+
         self._mqtt_host = host
         self._mqtt_port = port
         self._mqtt_user = user
         self._mqtt_password = password
         self._base_topic = base_topic
         self._mqtt_config_prefix = mqtt_config_prefix
+        self._hci_device = hci_device
 
         self._reconnection_interval = reconnection_interval
-        self._loop = loop or aio.get_event_loop()
+        self._loop = loop or aio.get_running_loop()
+        BLUETOOTH_RESTARTING = aio.Lock(loop=self._loop)
+
         self._mqtt_client = aio_mqtt.Client(
             client_id_prefix=f'{base_topic}_',
             loop=self._loop,
@@ -753,11 +766,11 @@ class Ble2Mqtt:
             # 10 empty scans in a row means that bluetooth restart is required
             if empty_scans >= 10:
                 empty_scans = 0
-                await restart_bluetooth()
+                await restart_bluetooth(self._hci_device)
 
             try:
-                async with handle_ble_exceptions():
-                    scanner = BleakScanner()
+                async with handle_ble_exceptions(self._hci_device):
+                    scanner = BleakScanner(adapter=self._hci_device)
                     scanner.register_detection_callback(
                         self.device_detection_callback,
                     )
@@ -791,6 +804,7 @@ class Ble2Mqtt:
                     mqtt_client=self._mqtt_client,
                     base_topic=self._base_topic,
                     config_prefix=self._mqtt_config_prefix,
+                    hci_device=self._hci_device,
                 )
             if dev.is_passive:
                 has_passive_devices = True
