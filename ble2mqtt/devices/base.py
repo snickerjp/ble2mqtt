@@ -4,31 +4,38 @@ import json
 import logging
 import typing as ty
 import uuid
+from collections import defaultdict, namedtuple
 from enum import Enum
 
 from bleak import BleakClient, BleakError
 from bleak.backends.device import BLEDevice
 
+from ..compat import get_loop_param
 from ..devices.uuids import DEVICE_NAME, FIRMWARE_VERSION
 from ..utils import format_binary, rssi_to_linkquality
+
+try:
+    from bleak.backends.bluezdbus.manager import get_global_bluez_manager
+except ImportError:
+    # bleak < 0.15
+    async def nothing(): return None
+
+    get_global_bluez_manager = nothing
 
 _LOGGER = logging.getLogger(__name__)
 registered_device_types = {}
 
 
 BINARY_SENSOR_DOMAIN = 'binary_sensor'
-SENSOR_DOMAIN = 'sensor'
-LIGHT_DOMAIN = 'light'
-SWITCH_DOMAIN = 'switch'
+CLIMATE_DOMAIN = 'climate'
 COVER_DOMAIN = 'cover'
 DEVICE_TRACKER_DOMAIN = 'device_tracker'
+LIGHT_DOMAIN = 'light'
 SELECT_DOMAIN = 'select'
+SENSOR_DOMAIN = 'sensor'
+SWITCH_DOMAIN = 'switch'
 
 DEFAULT_STATE_TOPIC = ''  # send to the parent topic
-
-
-class DeviceIsDisconnected(ConnectionError):
-    pass
 
 
 class CoverRunState(Enum):
@@ -48,6 +55,40 @@ class ConnectionMode(Enum):
 
 class ConnectionTimeoutError(ConnectionError):
     pass
+
+
+def done_callback(future: aio.Future):
+    exc_info = None
+    try:
+        exc_info = future.exception()
+    except aio.CancelledError:
+        pass
+
+    if exc_info is not None:
+        exc_info = (  # type: ignore
+            type(exc_info),
+            exc_info,
+            exc_info.__traceback__,
+        )
+        _LOGGER.exception(
+            f'{future} stopped unexpectedly',
+            exc_info=exc_info,
+        )
+
+
+async def extract_rssi(client: BleakClient) -> ty. Optional[int]:
+    if hasattr(client, 'get_rssi'):
+        return await client.get_rssi()
+    try:
+        if client.manager:
+            # bleak >= 0.15
+            props = client.manager._properties.get(
+                client._device_path, {}).get("org.bluez.Device1", {})
+        else:
+            props = client._properties
+    except AttributeError:
+        return None
+    return props.get('RSSI')
 
 
 class RegisteredType(abc.ABCMeta):
@@ -72,7 +113,6 @@ class BaseDevice(abc.ABC, metaclass=RegisteredType):
 
     # Whether we should stop handle task on disconnect or not
     # if true wait more to publish data to topics
-    # Used for devices that disconnects a few seconds after connect
     DEVICE_DROPS_CONNECTION: bool = False
 
     def __init__(self, *args, loop, **kwargs):
@@ -94,7 +134,7 @@ class BaseDevice(abc.ABC, metaclass=RegisteredType):
     def is_passive(self):
         return self._is_passive
 
-    async def disconnect(self):
+    async def close(self):
         pass
 
     async def _read_with_timeout(self, char, timeout=5):
@@ -102,7 +142,7 @@ class BaseDevice(abc.ABC, metaclass=RegisteredType):
             result = await aio.wait_for(
                 self.client.read_gatt_char(char),
                 timeout=timeout,
-                loop=self._loop,
+                **get_loop_param(self._loop),
             )
         except (aio.TimeoutError, BleakError, AttributeError):
             _LOGGER.exception(f'Cannot connect to device {self}')
@@ -137,22 +177,19 @@ class BaseDevice(abc.ABC, metaclass=RegisteredType):
         raise NotImplementedError()
 
 
-class ConnectionReason(Enum):
-    NONE = 0
-    MANUAL = 1
-    PERIODIC = 2
-
-
 class Device(BaseDevice, abc.ABC):
     MQTT_VALUES = None
     SET_POSTFIX: str = 'set'
     SET_POSITION_POSTFIX: str = 'set_position'  # for covers. Consider rework
+    SET_MODE_POSTFIX: str = 'set_mode'  # for climate
+    SET_TARGET_TEMPERATURE_POSTFIX: str = 'set_temperature'  # for climate
     MAC_TYPE: str = 'public'
     MANUFACTURER: str = None  # type: ignore
     CONNECTION_FAILURES_LIMIT = 100
     RECONNECTION_SLEEP_INTERVAL = 60
     ACTIVE_SLEEP_INTERVAL = 60
     PASSIVE_SLEEP_INTERVAL = 60
+    # deprecated
     LINKQUALITY_TOPIC: ty.Optional[str] = None
     STATE_TOPIC: str = DEFAULT_STATE_TOPIC
 
@@ -161,13 +198,7 @@ class Device(BaseDevice, abc.ABC):
 
     def __init__(self, mac, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # event triggered after device is connected
-        self.connected_event = aio.Event()
-        # event triggered after device is successfully connected and
-        # set up all initialization routines, like reading initial state
-        # and subscribing to char notifications
-        self.initialized_event = aio.Event()
-        self.message_queue: aio.Queue = aio.Queue()
+        self.message_queue: aio.Queue = aio.Queue(**get_loop_param(self._loop))
         self.mac = mac
         self.friendly_name = kwargs.pop('friendly_name', None)
         self._model = None
@@ -175,23 +206,17 @@ class Device(BaseDevice, abc.ABC):
         self._manufacturer = self.MANUFACTURER
         self._rssi = None
         self._advertisement_seen = aio.Event()
-        self.on_demand_connection = False
-        self.need_reconnection = aio.Event()  # used in on-demand connections
-        # used in on-demand connections
-        # if set, provides connection manager info that it already processed all
-        # periodic tasks and can be disconnected until next poll
-        self.can_disconnect = aio.Event()
-        self.connection_reason: ConnectionReason = ConnectionReason.NONE
 
         assert set(self.entities.keys()) <= {
             BINARY_SENSOR_DOMAIN,
-            SENSOR_DOMAIN,
-            LIGHT_DOMAIN,
-            SWITCH_DOMAIN,
+            CLIMATE_DOMAIN,
             COVER_DOMAIN,
-            SELECT_DOMAIN,
             DEVICE_TRACKER_DOMAIN,
-        }
+            LIGHT_DOMAIN,
+            SELECT_DOMAIN,
+            SENSOR_DOMAIN,
+            SWITCH_DOMAIN,
+        }, f'Unknown domain: {list(self.entities.keys())}'
 
     def set_advertisement_seen(self):
         self._advertisement_seen.set()
@@ -215,7 +240,12 @@ class Device(BaseDevice, abc.ABC):
         action_postfix = None
         if topic.startswith(self.unique_id):
             topic = topic[len(self.unique_id):]
-        for postfix in [self.SET_POSTFIX, self.SET_POSITION_POSTFIX]:
+        for postfix in [
+            self.SET_POSTFIX,
+            self.SET_POSITION_POSTFIX,
+            self.SET_MODE_POSTFIX,
+            self.SET_TARGET_TEMPERATURE_POSTFIX,
+        ]:
             if topic.endswith(postfix):
                 action_postfix = postfix
                 topic = topic[:-len(postfix)]
@@ -224,27 +254,30 @@ class Device(BaseDevice, abc.ABC):
 
     @property
     def subscribed_topics(self):
+        postfix_domains = {
+            self.SET_POSTFIX:
+                [
+                    CLIMATE_DOMAIN, COVER_DOMAIN, LIGHT_DOMAIN, SELECT_DOMAIN,
+                    SWITCH_DOMAIN,
+                ],
+            self.SET_POSITION_POSTFIX: [COVER_DOMAIN],
+            self.SET_MODE_POSTFIX: [CLIMATE_DOMAIN],
+            self.SET_TARGET_TEMPERATURE_POSTFIX: [CLIMATE_DOMAIN],
+        }
 
-        # TOOD: rebase _get_topic_for_entity ????
-        return [
-            '/'.join(filter(None, (
-                self.unique_id,
-                entity.get('topic', self.STATE_TOPIC),
-                self.SET_POSTFIX,
-            )))
-            for cls, items in self.entities.items()
-            for entity in items
-            if cls in [SWITCH_DOMAIN, LIGHT_DOMAIN, COVER_DOMAIN, SELECT_DOMAIN]
-        ] + [
-            '/'.join(filter(None, (
-                self.unique_id,
-                entity.get('topic', self.STATE_TOPIC),
-                self.SET_POSITION_POSTFIX,
-            )))
-            for cls, items in self.entities.items()
-            for entity in items
-            if cls in [COVER_DOMAIN]
-        ]
+        topics = []
+        for postfix, domains in postfix_domains.items():
+            topics.extend((
+                '/'.join(filter(None, (
+                    self.unique_id,
+                    entity.get('topic', self.STATE_TOPIC),
+                    postfix,
+                )))
+                for cls, items in self.entities.items()
+                for entity in items
+                if cls in domains
+            ))
+        return topics
 
     @property
     def manufacturer(self):
@@ -300,8 +333,12 @@ class Device(BaseDevice, abc.ABC):
 
     @property
     @abc.abstractmethod
-    def entities(self):
+    def entities(self) -> ty.Dict[str, ty.Any]:
         return {}
+
+    @abc.abstractmethod
+    def get_values_by_entities(self) -> ty.Dict[str, ty.Any]:
+        pass
 
     async def send_availability(self, publish_topic, value: bool):
         await publish_topic(
@@ -314,33 +351,6 @@ class Device(BaseDevice, abc.ABC):
         while True:
             await aio.sleep(1)
 
-    def request_for_connection(self, reason: ConnectionReason):
-        self.connection_reason = reason
-        self.need_reconnection.set()
-
-    async def wait_for_mqtt_message(self):
-        if self.on_demand_connection:
-            message = await self.message_queue.get()
-            _LOGGER.info(f'[{self}] New message {message}')
-            # await self.cancel_disconnect_timer()
-            if not self.client.is_connected:
-                _LOGGER.info(f'[{self}] set need_reconnection event')
-                self.request_for_connection(ConnectionReason.MANUAL)
-            await self.initialized_event.wait()
-            return message
-        else:
-            try:
-                message = await aio.wait_for(
-                    self.message_queue.get(),
-                    timeout=60,
-                )
-                if not self.client.is_connected:
-                    raise ConnectionError()
-                return message
-            except aio.TimeoutError:
-                await aio.sleep(1)
-        return None
-
     async def update_device_data(self, send_config):
         """
         Call this method on each iteration in handle.
@@ -349,8 +359,7 @@ class Device(BaseDevice, abc.ABC):
         if not self.config_sent:
             await send_config()
         if self.client:  # in passive mode, client is None
-            props = self.client._properties
-            self.rssi = props.get('RSSI')
+            self.rssi = await extract_rssi(self.client)
 
     def __str__(self):
         return self.unique_name
@@ -364,21 +373,17 @@ class Device(BaseDevice, abc.ABC):
             'value': value,
         })
 
-    async def on_first_connection(self):
-        """
-        Here put the initial configuration for the device on first connection
-        """
-        pass
-
-    async def on_each_connection(self):
-        """Here put code that is updated on every connection"""
+    async def get_device_data(self):
+        """Here put the initial configuration for the device"""
         pass
 
     async def get_client(self, **kwargs) -> BleakClient:
         assert self.MAC_TYPE in ('public', 'random')
-        return BleakClient(self.mac, address_type=self.MAC_TYPE, **kwargs)
+        client = BleakClient(self.mac, address_type=self.MAC_TYPE, **kwargs)
+        client.manager = await get_global_bluez_manager()
+        return client
 
-    async def connect(self, reason: ConnectionReason):
+    async def connect(self):
         if self.is_passive:
             return
 
@@ -387,44 +392,84 @@ class Device(BaseDevice, abc.ABC):
         )
         self.disconnected_event.clear()
         try:
-            await aio.wait_for(self.client.connect(), timeout=15.0)
-            self.connection_reason = reason
+            # 10 is the implicit timeout in bleak client, add 2 more seconds
+            # for internal routines
+            await aio.wait_for(self.client.connect(), timeout=12)
         except aio.TimeoutError as e:
-            _LOGGER.warning(f'[{self}] timed out on connect.')
             self.disconnected_event.set()
             raise ConnectionTimeoutError() from e
         except (Exception, aio.CancelledError):
             self.disconnected_event.set()
             raise
         self._advertisement_seen.clear()
-        self.connected_event.set()
         _LOGGER.info(f'Connected to {self.client.address}')
 
     def _on_disconnect(self, client, *args):
         _LOGGER.debug(f'Client {client.address} disconnected, device={self}')
-        self.connection_reason = ConnectionReason.NONE
         self.disconnected_event.set()
-        self.connected_event.clear()
-        self.initialized_event.clear()
-        self.can_disconnect.clear()
 
-    async def disconnect(self):
+    async def close(self):
         try:
             connected = self.client and self.client.is_connected
         # exception on macos when checking for is_connected()
         except AttributeError:
             connected = True
         if connected:
-            try:
-                await aio.wait_for(
-                    self.client.disconnect(),
-                    timeout=10,
+            await self.client.disconnect()
+        await super().close()
+
+    @property
+    def entities_with_lqi(self):
+        sensor_entities = self.entities.get(SENSOR_DOMAIN, [])
+        sensor_entities.append(
+            {
+                'name': 'linkquality',
+                'unit_of_measurement': 'lqi',
+                'icon': 'signal',
+                'entity_category': 'diagnostic',
+                **(
+                    {'topic': self.LINKQUALITY_TOPIC}
+                    if self.LINKQUALITY_TOPIC else {}
+                ),
+            },
+        )
+        return {
+            **self.entities,
+            SENSOR_DOMAIN: sensor_entities,
+        }
+
+    async def _notify_state(self, publish_topic):
+        values_by_name = {
+            'linkquality': self.linkquality,
+            **self.get_values_by_entities(),
+        }
+
+        _LOGGER.info(f'[{self}] send state={values_by_name}')
+
+        data_by_topic = defaultdict(dict)
+        for domain, entities in self.entities_with_lqi.items():
+            for entity in entities:
+                name = entity['name']
+                if name not in values_by_name:
+                    continue
+
+                value = values_by_name[name]
+                content_values = (
+                    value if isinstance(value, dict) else {name: value}
                 )
-            except aio.TimeoutError:
-                _LOGGER.exception(f'{self} not disconnected in 10 secs')
-        if not self.disconnected_event.is_set():
-            self.disconnected_event.set()
-        await super().disconnect()
+
+                for parameter, val in content_values.items():
+                    if domain in [SENSOR_DOMAIN, BINARY_SENSOR_DOMAIN]:
+                        val = self.transform_value(val)
+                    topic = self._get_topic_for_entity(entity)
+                    data_by_topic[topic][parameter] = val
+        coros = [
+            publish_topic(topic=topic, value=json.dumps(values))
+            for topic, values in data_by_topic.items()
+        ]
+        if coros:
+            await aio.gather(*coros)
+            self.initial_status_sent = True
 
 
 class Sensor(Device, abc.ABC):
@@ -434,15 +479,15 @@ class Sensor(Device, abc.ABC):
     REQUIRED_VALUES: ty.Sequence[str] = ()
     READ_DATA_IN_ACTIVE_LOOP: bool = False
 
-    def __init__(self, mac, *args, loop, **kwargs) -> None:
-        super().__init__(mac, *args, loop=loop, **kwargs)
+    def __init__(self, mac, *args, **kwargs) -> None:
+        super().__init__(mac, *args, **kwargs)
         self._state = None
 
     @property
     def entities(self):
         raise NotImplementedError()
 
-    async def on_first_connection(self):
+    async def get_device_data(self):
         name = await self._read_with_timeout(DEVICE_NAME)
         if isinstance(name, (bytes, bytearray)):
             self._model = name.decode().strip('\0')
@@ -517,7 +562,7 @@ class SubscribeAndSetDataMixin:
         self._state = self.SENSOR_CLASS.from_data(data)
 
     def notification_handler(self, sender, data: bytearray):
-        _LOGGER.debug("Mixin: {0} notification: {1}: {2}".format(
+        _LOGGER.debug("{0} notification: {1}: {2}".format(
             self,
             sender,
             format_binary(data),
@@ -525,125 +570,260 @@ class SubscribeAndSetDataMixin:
         if self.filter_notifications(sender):
             self.process_data(data)
 
-    async def on_each_connection(self):
+    async def get_device_data(self):
         if self.DATA_CHAR:
             await self.client.start_notify(
                 self.DATA_CHAR,
                 self.notification_handler,
             )
-        await super().on_each_connection()
+        await super().get_device_data()
 
 
-class SupportOnDemandConnection(BaseDevice, abc.ABC):
-    """
-    Allow keep connection off until a message from MQTT received or
-    periodic poll run
-    """
+class CoverMovementType(Enum):
+    STOP = 0
+    POSITION = 1
 
-    ON_DEMAND_CONNECTION = False
-    ON_DEMAND_POLL_TIME = 60 * 60  # connect and request state every 60 minutes
-    ON_DEMAND_KEEP_ALIVE_TIME = 60 * 2  # keep connected for 2 minutes
+
+class BaseCover(Device, abc.ABC):
+    COVER_ENTITY = 'cover'
+
+    # HA notation. We convert value on setting and receiving data
+    CLOSED_POSITION = 0
+    OPEN_POSITION = 100
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.on_demand_connection = self.ON_DEMAND_CONNECTION
-        self.on_demand_poll_time = self.ON_DEMAND_POLL_TIME
-        self.on_demand_keep_alive_time = self.ON_DEMAND_KEEP_ALIVE_TIME
-        if 'on_demand_connection' in kwargs:
-            self.on_demand_connection = bool(kwargs['on_demand_connection'])
-        if 'on_demand_poll_time' in kwargs:
-            self.on_demand_poll_time = int(kwargs['on_demand_poll_time'])
-        if 'on_demand_keep_alive_time' in kwargs:
-            self.on_demand_keep_alive_time = \
-                int(kwargs['on_demand_keep_alive_time'])
-        self.disconnect_delay_task = None
-        self.command_in_progress = aio.Lock()
+        self._state = namedtuple(
+            'CoverState',
+            (
+                'position', 'target_position', 'run_state',
+            ),
+        )(position=0, target_position=0, run_state=CoverRunState.STOPPED)
 
-    async def init_disconnect_timer(self, period=None):
-        if self.disconnect_delay_task:
-            # postpone disconnection
-            await self.cancel_disconnect_timer()
-        if self.on_demand_connection:
-            async def _sleep_and_disconnect():
-                coros = [
-                    aio.sleep(self.on_demand_keep_alive_time),
-                ]
-                if self.connection_reason == ConnectionReason.PERIODIC:
-                    coros.append(self.can_disconnect.wait())
-                await aio.wait(
-                    coros,
-                    return_when=aio.FIRST_COMPLETED,
+    @property
+    def entities(self):
+        return {
+            COVER_DOMAIN: [
+                {
+                    'name': self.COVER_ENTITY,
+                    'topic': self.COVER_ENTITY,
+                    'device_class': 'shade',
+                },
+            ],
+            SENSOR_DOMAIN: [
+                {
+                    'name': 'battery',
+                    'device_class': 'battery',
+                    'unit_of_measurement': '%',
+                },
+                {
+                    'name': 'illuminance',
+                    'device_class': 'illuminance',
+                    'unit_of_measurement': 'lx',
+                },
+            ],
+        }
+
+    @abc.abstractmethod
+    async def _stop(self):
+        pass
+
+    @abc.abstractmethod
+    async def _set_position(self, value):
+        pass
+
+    @abc.abstractmethod
+    async def _update_running_state(self):
+        """ This method is called as a short update while
+        opening the shades"""
+
+    @abc.abstractmethod
+    async def _update_full_state(self):
+        """ This method is called to refetch all values from the device"""
+
+    async def _do_movement(self, movement_type: CoverMovementType,
+                           target_position: ty.Optional[int]):
+        if movement_type == CoverMovementType.POSITION and \
+                target_position is not None:
+            if self.CLOSED_POSITION <= target_position <= self.OPEN_POSITION:
+                await self._set_position(target_position)
+                if self._state.position > target_position:
+                    self._state.target_position = target_position
+                    self._state.run_state = CoverRunState.CLOSING
+                elif self._state.position < target_position:
+                    self._state.target_position = target_position
+                    self._state.run_state = CoverRunState.OPENING
+                else:
+                    self._state.target_position = None
+                    if target_position == self.OPEN_POSITION:
+                        self._state.run_state = CoverRunState.OPEN
+                    elif target_position == self.CLOSED_POSITION:
+                        self._state.run_state = CoverRunState.CLOSED
+                    else:
+                        self._state.run_state = CoverRunState.STOPPED
+            else:
+                _LOGGER.error(
+                    f'[{self}] Incorrect position value: '
+                    f'{repr(target_position)}',
                 )
+        else:
+            await self._stop()
+            self._state.run_state = CoverRunState.STOPPED
+
+    async def _handle_message(self, message, publish_topic):
+        value = message['value']
+        entity_topic, action_postfix = self.get_entity_subtopic_from_topic(
+            message['topic'],
+        )
+        if entity_topic == self._get_topic_for_entity(
+                self.get_entity_by_name(COVER_DOMAIN, self.COVER_ENTITY),
+                skip_unique_id=True,
+        ):
+            value = self.transform_value(value)
+            target_position = None
+            if action_postfix == self.SET_POSTFIX:
                 _LOGGER.info(
-                    f'[{self}] disconnect after inactivity due to '
-                    f'on-demand policy, '
-                    f'connection reason: {self.connection_reason.name}',
+                    f'[{self}] set mode {entity_topic} to "{value}"',
                 )
-                await self.disconnect()
+                if value.lower() == 'open':
+                    movement_type = CoverMovementType.POSITION
+                    target_position = self.OPEN_POSITION
+                elif value.lower() == 'close':
+                    movement_type = CoverMovementType.POSITION
+                    target_position = self.CLOSED_POSITION
+                else:
+                    movement_type = CoverMovementType.STOP
+            elif action_postfix == self.SET_POSITION_POSTFIX:
+                movement_type = CoverMovementType.POSITION
+                _LOGGER.info(
+                    f'[{self}] set position {entity_topic} to "{value}"',
+                )
+                try:
+                    target_position = int(value)
+                except ValueError:
+                    pass
+            else:
+                _LOGGER.warning(
+                    f'[{self}] unknown action postfix {action_postfix}',
+                )
+                return False
 
-            _LOGGER.debug(
-                f'{self} set callback for disconnection, sleep for '
-                f'{self.on_demand_keep_alive_time} secs and then disconnect',
-            )
-            self.disconnect_delay_task = aio.create_task(
-                _sleep_and_disconnect(),
-            )
+            while True:
+                try:
+                    await self._do_movement(movement_type, target_position)
+                    await self._notify_state(publish_topic)
+                    break
+                except ConnectionError as e:
+                    _LOGGER.exception(str(e))
+                await aio.sleep(5)
+            return True
 
-    async def cancel_disconnect_timer(self):
-        if self.disconnect_delay_task:
-            _LOGGER.debug(f'{self} cancel disconnected callback')
-            self.disconnect_delay_task.cancel()
-            try:
-                await self.disconnect_delay_task
-            except aio.CancelledError:
-                pass
-            self.disconnect_delay_task = None
-
-    async def connect(self, *args, **kwargs):
-        if self.disconnect_delay_task:
-            await self.cancel_disconnect_timer()
-        await super().connect(*args, **kwargs)
-        self.need_reconnection.clear()
-        if not self.is_passive:
-            await self.init_disconnect_timer()
-
-    async def disconnect(self):
-        async with self.command_in_progress:
-            return await super().disconnect()
-
-
-class ActiveDeviceHandler:
-    def __init__(self, device, publish_topic, *args, **kwargs):
-        self.device = device
-        self.publish_topic = publish_topic
-        self.timer = 0
-
-    async def handle_wrapper(self, send_config, handle_loop):
+    async def handle_messages(self, publish_topic, *args, **kwargs):
         while True:
-            await self.device.connected_event.wait()
-            await self.device.initialized_event.wait()
-            await self.device.update_device_data(send_config)
             try:
-                await handle_loop(self.publish_topic, self)
-                self.timer += self.device.ACTIVE_SLEEP_INTERVAL
-            except DeviceIsDisconnected:
+                if not self.client.is_connected:
+                    raise ConnectionError()
+                message = await aio.wait_for(
+                    self.message_queue.get(),
+                    timeout=60,
+                )
+            except aio.TimeoutError:
+                await aio.sleep(1)
                 continue
-            await aio.sleep(self.device.ACTIVE_SLEEP_INTERVAL)
-
-    def reset_timer(self):
-        self.timer = 0
+            await self._handle_message(message, publish_topic)
 
 
-class SupportOnDemandCommand(SupportOnDemandConnection):
-    async def handle_loop(self, publish_topic, handler: ActiveDeviceHandler):
-        raise NotImplementedError()
+class ClimateMode(Enum):
+    OFF = 'off'
+    HEAT = 'heat'
 
-    async def handle(self, publish_topic, send_config, *args, **kwargs):
-        handler = ActiveDeviceHandler(self, publish_topic)
-        await handler.handle_wrapper(send_config, self.handle_loop)
 
-    async def send_command(self, *args, **kwargs):
-        async with self.command_in_progress:
-            if not self.client.is_connected:
-                raise DeviceIsDisconnected()
-            return await super().send_command(*args, **kwargs)
+class BaseClimate(Device, abc.ABC):
+    CLIMATE_ENTITY = 'climate'
+    MODES: ty.Iterable[ClimateMode] = ()
+
+    @property
+    def entities(self):
+        return {
+            CLIMATE_DOMAIN: [
+                {
+                    'name': self.CLIMATE_ENTITY,
+                    'modes': [x.value for x in self.MODES],
+                },
+            ],
+        }
+
+    @abc.abstractmethod
+    async def _set_target_temperature(self, value):
+        pass
+
+    @abc.abstractmethod
+    async def _switch_mode(self, next_mode):
+        pass
+
+    async def _handle_message(self, message, publish_topic):
+        value = message['value']
+        entity_topic, action_postfix = self.get_entity_subtopic_from_topic(
+            message['topic'],
+        )
+        if entity_topic == self._get_topic_for_entity(
+                self.get_entity_by_name(CLIMATE_DOMAIN, self.CLIMATE_ENTITY),
+                skip_unique_id=True,
+        ):
+            if action_postfix == self.SET_MODE_POSTFIX:
+                _LOGGER.info(
+                    f'[{self}] set mode {entity_topic} to "{value}"',
+                )
+                try:
+                    value = ClimateMode(value.lower())
+                except ValueError:
+                    _LOGGER.warning(f"{self} Incorrect mode {value}")
+                    return False
+                else:
+                    if value not in self.MODES:
+                        _LOGGER.warning(f"{self} Incorrect mode {value}")
+                        return False
+                state_change_coro = self._switch_mode(value)
+            elif action_postfix == self.SET_TARGET_TEMPERATURE_POSTFIX:
+                try:
+                    target_temperature = float(value)
+                except ValueError:
+                    _LOGGER.exception("Incorrect temperature")
+                    return False
+                _LOGGER.info(
+                    f'[{self}] set temperature {entity_topic} to "{value}"',
+                )
+                state_change_coro = \
+                    self._set_target_temperature(target_temperature)
+            else:
+                _LOGGER.warning(
+                    f'[{self}] unknown action postfix {action_postfix}',
+                )
+                return False
+
+            if not state_change_coro:
+                return False
+
+            while True:
+                try:
+                    await state_change_coro
+                    await self._notify_state(publish_topic)
+                    break
+                except ConnectionError as e:
+                    _LOGGER.exception(str(e))
+                await aio.sleep(5)
+            return True
+
+    async def handle_messages(self, publish_topic, *args, **kwargs):
+        while True:
+            try:
+                if not self.client.is_connected:
+                    raise ConnectionError()
+                message = await aio.wait_for(
+                    self.message_queue.get(),
+                    timeout=60,
+                )
+            except aio.TimeoutError:
+                await aio.sleep(1)
+                continue
+            await self._handle_message(message, publish_topic)

@@ -1,14 +1,12 @@
 import asyncio as aio
-import json
 import logging
 import uuid
-from functools import partial
 
-from ..helpers import done_callback
+from ..compat import get_loop_param
 from ..protocols.redmond import (ColorTarget, KettleG200Mode, KettleG200State,
                                  KettleRunState, RedmondKettle200Protocol)
 from .base import (LIGHT_DOMAIN, SENSOR_DOMAIN, SWITCH_DOMAIN, ConnectionMode,
-                   ActiveDeviceHandler, Device, SupportOnDemandCommand)
+                   Device)
 from .uuids import DEVICE_NAME
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,10 +19,10 @@ HEAT_ENTITY = 'heat'  # not implemented yet
 TEMPERATURE_ENTITY = 'temperature'
 ENERGY_ENTITY = 'energy'
 LIGHT_ENTITY = 'backlight'
+STATISTICS_ENTITY = 'statistics'
 
 
-# MRO makes sense
-class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
+class RedmondKettle(RedmondKettle200Protocol, Device):
     MAC_TYPE = 'random'
     NAME = 'redmond_rk_g200'
     TX_CHAR = UUID_NORDIC_TX
@@ -51,7 +49,6 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
         self._send_data_period_multiplier = \
             self.STANDBY_SEND_DATA_PERIOD_MULTIPLIER
         self.initial_status_sent = False
-        self.command_in_progress = aio.Lock()
 
     @property
     def entities(self):
@@ -72,15 +69,18 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
                 {
                     'name': ENERGY_ENTITY,
                     'device_class': 'energy',
-                    'unit_of_measurement': 'Wh',
+                    'unit_of_measurement': 'kWh',
+                    'state_class': 'total_increasing',
+                    'entity_category': 'diagnostic',
                 },
                 {
-                    'name': 'statistics',
-                    'topic': 'statistics',
+                    'name': STATISTICS_ENTITY,
+                    'topic': STATISTICS_ENTITY,
                     'icon': 'chart-bar',
                     'json': True,
                     'main_value': 'number_of_starts',
                     'unit_of_measurement': ' ',
+                    'entity_category': 'diagnostic',
                 },
             ],
             LIGHT_DOMAIN: [
@@ -91,18 +91,37 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
             ],
         }
 
-    async def on_first_connection(self):
-        await super().on_first_connection()
+    def get_values_by_entities(self):
+        return {
+            TEMPERATURE_ENTITY: self._state.temperature,
+            ENERGY_ENTITY: self._energy,
+            STATISTICS_ENTITY: self._statistics,
+            LIGHT_ENTITY: {
+                'state': (
+                    KettleRunState.ON.name
+                    if self._state.state == KettleRunState.ON and
+                    self._state.mode == KettleG200Mode.LIGHT
+                    else KettleRunState.OFF.name
+                ),
+                'brightness': 255,
+                'color': {
+                    'r': self._color[0],
+                    'g': self._color[1],
+                    'b': self._color[2],
+                },
+                'color_mode': 'rgb',
+            },
+        }
+
+    async def get_device_data(self):
+        await self.protocol_start()
+        await self.login(self._key)
         model = await self._read_with_timeout(DEVICE_NAME)
         if isinstance(model, (bytes, bytearray)):
             self._model = model.decode()
         else:
             # macos can't access characteristic
             self._model = 'G200S'
-
-    async def on_each_connection(self):
-        await self.protocol_start()
-        await self.login(self._key)
         version = await self.get_version()
         if version:
             self._version = f'{version[0]}.{version[1]}'
@@ -113,20 +132,6 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
             self.initial_status_sent = False
         await self.set_time()
         await self._update_statistics()
-        await super().on_each_connection()
-
-    async def disconnect(self):
-        await self.protocol_stop()
-        return await super().disconnect()
-
-    def _on_disconnect(self, client, *args):
-        # clear items after device disconnected
-        super()._on_disconnect(client, *args)
-        task = aio.create_task(self.protocol_stop())
-        task.add_done_callback(partial(
-            done_callback,
-            f'{self} protocol_stop() stopped unexpectedly',
-        ))
 
     def update_multiplier(self, state: KettleG200State = None):
         if state is None:
@@ -139,64 +144,6 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
             ]
             else self.STANDBY_SEND_DATA_PERIOD_MULTIPLIER
         )
-
-    async def _notify_state(self, publish_topic):
-        _LOGGER.info(f'[{self}] send state={self._state}')
-        coros = []
-
-        state = {'linkquality': self.linkquality}
-        for sensor_name, value in (
-            (TEMPERATURE_ENTITY, self._state.temperature),
-            (ENERGY_ENTITY, self._energy),
-        ):
-            if any(
-                    x['name'] == sensor_name
-                    for x in self.entities.get(SENSOR_DOMAIN, [])
-            ):
-                state[sensor_name] = self.transform_value(value)
-
-        if state:
-            coros.append(publish_topic(
-                topic=self._get_topic(self.STATE_TOPIC),
-                value=json.dumps(state),
-            ))
-
-        # keep statistics in a separate topic
-        _LOGGER.info(f'[{self}] send statistics={self._statistics}')
-        for sensor_name, value in (
-            ('statistics', self._statistics),
-        ):
-            entity = self.get_entity_by_name(SENSOR_DOMAIN, sensor_name)
-            if entity:
-                coros.append(publish_topic(
-                    topic=self._get_topic_for_entity(entity),
-                    value=json.dumps(value),
-                ))
-
-        lights = self.entities.get(LIGHT_DOMAIN, [])
-        for light in lights:
-            if light['name'] == LIGHT_ENTITY:
-                light_state = {
-                    'state': (
-                        KettleRunState.ON.name
-                        if self._state.state == KettleRunState.ON and
-                        self._state.mode == KettleG200Mode.LIGHT
-                        else KettleRunState.OFF.name
-                    ),
-                    'brightness': 255,
-                    'color': {
-                        'r': self._color[0],
-                        'g': self._color[1],
-                        'b': self._color[2],
-                    },
-                    'color_mode': 'rgb',
-                }
-                coros.append(publish_topic(
-                    topic=self._get_topic_for_entity(light),
-                    value=json.dumps(light_state),
-                ))
-        if coros:
-            await aio.gather(*coros)
 
     async def notify_run_state(self, new_state: KettleG200State, publish_topic):
         if not self.initial_status_sent or \
@@ -242,23 +189,24 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
             'Energy spent (kWh)': round(statistics['watts_hours']/1000, 2),
             'Working time (minutes)': round(statistics['seconds_run']/60, 1),
         }
-        self._energy = statistics['watts_hours']
+        self._energy = round(statistics['watts_hours']/1000, 2)
 
-    async def handle_loop(self, publish_topic, handler: ActiveDeviceHandler,
-                          *args, **kwargs):
-        # works while disconnected too
-        new_state = await self.get_mode()
-        await self.notify_run_state(new_state, publish_topic)
-        if new_state.mode == KettleG200Mode.BOIL and new_state.state == KettleRunState.ON:
-            await self.init_disconnect_timer()
-        self.can_disconnect.set()
+    async def handle(self, publish_topic, send_config, *args, **kwargs):
+        counter = 0
+        while True:
+            await self.update_device_data(send_config)
+            # if boiling notify every 5 seconds, 60 sec otherwise
+            new_state = await self.get_mode()
+            await self.notify_run_state(new_state, publish_topic)
+            counter += 1
 
-        if handler.timer > (
-                self.SEND_DATA_PERIOD * self._send_data_period_multiplier
-        ):
-            await self._update_statistics()
-            await self._notify_state(publish_topic)
-            handler.reset_timer()
+            if counter > (
+                    self.SEND_DATA_PERIOD * self._send_data_period_multiplier
+            ):
+                await self._update_statistics()
+                await self._notify_state(publish_topic)
+                counter = 0
+            await aio.sleep(self.ACTIVE_SLEEP_INTERVAL)
 
     async def _switch_mode(self, mode, value):
         if value == KettleRunState.ON.name:
@@ -285,10 +233,16 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
 
     async def handle_messages(self, publish_topic, *args, **kwargs):
         while True:
-            message = await self.wait_for_mqtt_message()
-            if message is None:
+            try:
+                if not self.client.is_connected:
+                    raise ConnectionError()
+                message = await aio.wait_for(
+                    self.message_queue.get(),
+                    timeout=60,
+                )
+            except aio.TimeoutError:
+                await aio.sleep(1)
                 continue
-
             value = message['value']
             entity_topic, action_postfix = self.get_entity_subtopic_from_topic(
                 message['topic'],
@@ -313,15 +267,12 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
                                 value=self.transform_value(value),
                             ),
                             self._notify_state(publish_topic),
-                            loop=self._loop,
+                            **get_loop_param(self._loop),
                         )
                         break
                     except ConnectionError as e:
                         _LOGGER.exception(str(e))
                     await aio.sleep(5)
-                if value != KettleRunState.ON.name:
-                    # we don't disconnect until kettle is boiled
-                    await self.init_disconnect_timer()
                 continue
 
             entity = self.get_entity_by_name(LIGHT_DOMAIN, LIGHT_ENTITY)
@@ -348,6 +299,5 @@ class RedmondKettle(SupportOnDemandCommand, RedmondKettle200Protocol, Device):
                             self._brightness,
                         ),
                         self._notify_state(publish_topic),
-                        loop=self._loop,
+                        **get_loop_param(self._loop),
                     )
-            await self.init_disconnect_timer()

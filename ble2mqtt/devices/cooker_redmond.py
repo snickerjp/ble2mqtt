@@ -1,9 +1,9 @@
 import asyncio as aio
-import json
 import logging
 import uuid
 from contextlib import asynccontextmanager
 
+from ..compat import get_loop_param
 from ..protocols.redmond import (COOKER_PREDEFINED_PROGRAMS, CookerRunState,
                                  CookerState, RedmondCookerProtocol,
                                  RedmondError)
@@ -46,8 +46,8 @@ class RedmondCooker(RedmondCookerProtocol, Device):
     STANDBY_SEND_DATA_PERIOD_MULTIPLIER = 12  # 12 * 5 seconds in standby mode
 
     def __init__(self, mac, key='ffffffffffffffff', default_program='express',
-                 *args, loop, **kwargs):
-        super().__init__(mac, *args, loop=loop, **kwargs)
+                 *args, **kwargs):
+        super().__init__(mac, *args, **kwargs)
         assert isinstance(key, str) and len(key) == 16
         self._default_program = default_program
         self._key = bytes.fromhex(key)
@@ -99,6 +99,21 @@ class RedmondCooker(RedmondCookerProtocol, Device):
             ],
         }
 
+    def get_values_by_entities(self):
+        return {
+            TEMPERATURE_ENTITY: self._state.target_temperature,
+            MODE_ENTITY: self._state.state.name.title().replace('_', ' '),
+            PREDEFINED_PROGRAM_ENTITY: const_to_option(
+                {
+                    (state.program, state.subprogram): k
+                    for k, state in COOKER_PREDEFINED_PROGRAMS.items()
+                }.get(
+                    (self._state.program, self._state.subprogram),
+                    '',
+                ),
+            ),
+        }
+
     async def update_device_state(self):
         state = await self.get_mode()
         if state:
@@ -135,44 +150,6 @@ class RedmondCooker(RedmondCookerProtocol, Device):
             ]
             else self.STANDBY_SEND_DATA_PERIOD_MULTIPLIER
         )
-
-    async def _notify_state(self, publish_topic):
-        _LOGGER.info(f'[{self}] send state={self._state}')
-        coros = []
-
-        state = {'linkquality': self.linkquality}
-        for sensor_name, value in (
-            (TEMPERATURE_ENTITY, self._state.target_temperature),
-            (MODE_ENTITY, self._state.state.name.title().replace('_', ' ')),
-        ):
-            if any(
-                    x['name'] == sensor_name
-                    for x in self.entities.get(SENSOR_DOMAIN, [])
-            ):
-                state[sensor_name] = value  # no need to transform
-
-        if state:
-            coros.append(publish_topic(
-                topic=self._get_topic(self.STATE_TOPIC),
-                value=json.dumps(state),
-            ))
-
-        selects = self.entities.get(SELECT_DOMAIN, [])
-        for select in selects:
-            if select['name'] == PREDEFINED_PROGRAM_ENTITY:
-                back_programs = {
-                    (state.program, state.subprogram): k
-                    for k, state in COOKER_PREDEFINED_PROGRAMS.items()
-                }
-                coros.append(publish_topic(
-                    topic=self._get_topic_for_entity(select),
-                    value=const_to_option(back_programs.get(
-                        (self._state.program, self._state.subprogram),
-                        '',
-                    )),
-                ))
-        if coros:
-            await aio.gather(*coros)
 
     async def notify_run_state(self, new_state: CookerState, publish_topic):
         if not self.initial_status_sent or \
@@ -256,7 +233,7 @@ class RedmondCooker(RedmondCookerProtocol, Device):
                             value=self.transform_value(value),
                         ),
                         self._notify_state(publish_topic),
-                        loop=self._loop,
+                        **get_loop_param(self._loop),
                     )
                     break
                 except ConnectionError as e:
@@ -327,7 +304,7 @@ class RedmondCooker(RedmondCookerProtocol, Device):
                                 ),
                             ),
                             self._notify_state(publish_topic),
-                            loop=self._loop,
+                            **get_loop_param(self._loop),
                         )
                         break
                     except ConnectionError as e:

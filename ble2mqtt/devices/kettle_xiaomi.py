@@ -1,5 +1,4 @@
 import asyncio as aio
-import json
 import logging
 import struct
 import time
@@ -8,6 +7,7 @@ import uuid
 from dataclasses import dataclass
 from enum import Enum
 
+from ..compat import get_loop_param
 from ..protocols.xiaomi import XiaomiCipherMixin
 from ..utils import format_binary
 from .base import BINARY_SENSOR_DOMAIN, SENSOR_DOMAIN, ConnectionMode, Device
@@ -104,8 +104,8 @@ class XiaomiKettle(XiaomiCipherMixin, Device):
     ACTIVE_CONNECTION_MODE = ConnectionMode.ACTIVE_KEEP_CONNECTION
 
     def __init__(self, mac, product_id=275, token=None,
-                 *args, loop, **kwargs):
-        super().__init__(mac, *args, loop=loop, **kwargs)
+                 *args, **kwargs):
+        super().__init__(mac, *args, **kwargs)
         self._product_id = product_id
         if token:
             assert isinstance(token, str) and len(token) == 24
@@ -133,6 +133,12 @@ class XiaomiKettle(XiaomiCipherMixin, Device):
                     'device_class': 'heat',
                 },
             ],
+        }
+
+    def get_values_by_entities(self):
+        return {
+            KETTLE_ENTITY: self._state.as_dict(),
+            HEAT_ENTITY: self._state.mode in [Mode.HEATING, Mode.KEEP_WARM],
         }
 
     def notification_handler(self, sender: int, data: bytearray):
@@ -171,52 +177,20 @@ class XiaomiKettle(XiaomiCipherMixin, Device):
         await self.client.read_gatt_char(UUID_VER)
         await self.client.stop_notify(UUID_AUTH)
 
-    async def on_first_connection(self):
-        self.queue = aio.Queue()
+    async def get_device_data(self):
+        self.queue = aio.Queue(**get_loop_param(self._loop))
         await self.auth()
         self._model = 'MiKettle'
         version = await self.client.read_gatt_char(SOFTWARE_VERSION)
         if version:
             self._version = version.decode()
         _LOGGER.debug(f'{self} version: {version}')
-
-    async def on_each_connection(self):
         await self.client.start_notify(UUID_STATUS, self.notification_handler)
-
-    async def _notify_state(self, publish_topic):
-        _LOGGER.info(f'[{self}] send state={self._state}')
-        state = {}
-        for sensor_name, value in (
-            (KETTLE_ENTITY, self._state),
-        ):
-            if any(
-                x['name'] == sensor_name
-                for x in self.entities.get(SENSOR_DOMAIN, [])
-            ):
-                state.update(value.as_dict())
-
-        if state:
-            state['linkquality'] = self.linkquality
-            await publish_topic(
-                topic=self._get_topic(self.STATE_TOPIC),
-                value=json.dumps(state),
-            )
-        for sensor_name, value in (
-            (HEAT_ENTITY, self._state.mode in [Mode.HEATING, Mode.KEEP_WARM]),
-        ):
-            entity = self.get_entity_by_name(BINARY_SENSOR_DOMAIN, sensor_name)
-            if entity:
-                await publish_topic(
-                    topic=self._get_topic_for_entity(entity),
-                    value=self.transform_value(value),
-                )
 
     async def handle(self, publish_topic, send_config, *args, **kwargs):
         send_time = None
         prev_state = None
         while True:
-            await self.connected_event.wait()
-            await self.initialized_event.wait()
             await self.update_device_data(send_config)
             new_state = prev_state
             if self._state:

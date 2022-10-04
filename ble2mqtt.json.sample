@@ -23,8 +23,17 @@
             "key": "ffffffffffffffee"
         },
         {
+            "address": "11:22:33:aa:bb:c1",
+            "type": "ensto_thermostat",
+            "key": "00112233"
+        },
+        {
             "address": "11:22:33:aa:bb:de",
             "type": "am43"
+        },
+        {
+            "address": "11:22:33:aa:bb:ed",
+            "type": "soma_shades"
         },
         {
             "address": "11:22:33:aa:bb:dd",
